@@ -1,188 +1,112 @@
-# Authors: Rick van Bellen, Pierre Onghena, Tim Debets
+# Author: Rick van Bellen, Pierre Onghena, Tim Debets
 
+import math
 import pygame
 from pygame.locals import *
 import settings
 import numpy as np
-from Sensor import Sensor
 from utility import *
+
+
+def predict_position(beacon_features):
+    # If there is one beacon or less, we can't predict the position
+    if len(beacon_features) <= 2:
+        return None
+    else:
+        x0, y0, r0 = beacon_features[0][0].x, beacon_features[0][0].y, beacon_features[0][0].distance
+        x1, y1, r1 = beacon_features[1][0].x, beacon_features[1][0].y, beacon_features[1][0].distance
+        x2, y2, r2 = beacon_features[2][0].x, beacon_features[2][0].y, beacon_features[2][0].distance
+
+        # Intersections of circle 1 and 2
+        intersection1, intersection2 = intersection_points(x0, y0, r0, x1, y1, r1)
+
+        # Intersections of circle 1 and 3
+        intersection3, intersection4 = intersection_points(x0, y0, r0, x2, y2, r2)
+        # Get the final verdict
+        if calc_distance(intersection1, intersection3) < 0.01 or calc_distance(intersection1, intersection4) < 0.01:
+            x, y = intersection1
+        else:
+            x, y = intersection2
+
+        # I still don't know which is correct without using theta so I'll just return x3 and y3
+        angle_intersection_to_circle_center = math.atan(abs(y - y0) / abs(x - x0))
+        orientation = (angle_intersection_to_circle_center + beacon_features[0][1]) % (2 * math.pi)
+        return np.array([x, y, orientation])
+
+
+# Method for Kalman filter
+def kalman_filter(previous_state, previous_covariance, action, beacon_features, B, R, Q):
+    A = np.eye(3)
+    C = np.eye(3)
+
+    # Prediction
+    pred_state = A.dot(previous_state) + B.dot(action)
+    pred_covariance = A.dot(previous_covariance).dot(A.T) + R
+
+    # Correction
+    z = predict_position(beacon_features)
+    if z is None:
+        state = pred_state
+        covariance = pred_covariance
+    else:
+        # Sensor noise
+        noise_x, noise_y, noise_t = np.random.normal(0, 1), np.random.normal(0, 1), \
+                                    np.random.normal(0, 0.1)
+        noise_sensor = [noise_x, noise_y, noise_t]
+        z = np.add(z, noise_sensor)
+        K = pred_covariance.dot(C.T).dot(np.linalg.inv(C.dot(pred_covariance).dot(C.T) + Q))
+        state = pred_state + K.dot(z - C.dot(pred_state))
+        covariance = (np.eye(3) - K.dot(C)).dot(pred_covariance)
+
+    return state, covariance
 
 
 # class that defines the robot
 class Robot(pygame.sprite.Sprite):
-    def __init__(self, radius, nr_sensors):
+    def __init__(self, radius):
         super(Robot, self).__init__()
         self.id = 'robot'
         self.surf = pygame.Surface((2 * radius, 2 * radius), pygame.SRCALPHA)
         self.surf.fill((255, 255, 255, 0))
         self.rect = self.surf.get_rect()
-        self.rect.move_ip((settings.SCREEN_WIDTH // 2 - radius, settings.SCREEN_HEIGHT // 2 - radius))
-        self.Vl = 0  # 1000000
-        self.Vr = 0  # 1000000
+        self.rect.move_ip(200, 200)
+        self.v = 0
         self.radius = radius
         self.l = 2 * radius
         self.x = self.rect.centerx
         self.y = self.rect.centery
-        self.theta = 0.5 * math.pi
-        self.sensors = []
-        self.vacuum = 0
-        self.activation_sensor = 0
-
-        # Put the sensors on the robot evenly distanced from each other
-        angles_between_sensors = 2 * math.pi / nr_sensors
-        angle = 0
-        for i in range(nr_sensors):
-            sensor = Sensor(angle, i)
-            sensor.id = i + 1
-            angle += angles_between_sensors
-            self.sensors.append(sensor)
+        self.theta = 0
+        self.state = np.array([self.x, self.y, self.theta])
+        self.covariance = np.diag([0, 0, 0])
 
     # Define the robot movement
-    def update(self, pressed_keys, walls, dusts):
+    def update(self, pressed_keys, beacons):
+        omega = 0
         # Handle user input
         if pressed_keys[K_w]:
-            self.Vl += settings.V_step
+            self.v += settings.V_step
         if pressed_keys[K_s]:
-            self.Vl -= settings.V_step
-        if pressed_keys[K_o]:
-            self.Vr += settings.V_step
-        if pressed_keys[K_l]:
-            self.Vr -= settings.V_step
+            self.v -= settings.V_step
+        if pressed_keys[K_a]:
+            omega = settings.theta_step
+            self.theta -= omega
+            if self.theta <= 0:
+                self.theta += 2 * math.pi
+        if pressed_keys[K_d]:
+            omega = settings.theta_step
+            self.theta += omega
+            if self.theta >= 2 * math.pi:
+                self.theta -= 2 * math.pi
         if pressed_keys[K_x]:
-            self.Vl = 0
-            self.Vr = 0
-        if pressed_keys[K_t]:
-            self.Vl += settings.V_step
-            self.Vr += settings.V_step
-        if pressed_keys[K_g]:
-            self.Vl -= settings.V_step
-            self.Vr -= settings.V_step
+            self.v = 0
 
         # Move the robot, and register positions
-        x_old = self.rect.centerx
-        y_old = self.rect.centery
-        # If the wheels velocities do not match, calculate the angle in which to move
-        if self.Vl != self.Vr:
-            R = self.radius * (self.Vl + self.Vr) / (self.Vl - self.Vr)
-            omega = (self.Vl - self.Vr) / self.l
-            ICCx = self.x - R * math.sin(self.theta)
-            ICCy = self.y + R * math.cos(self.theta)
-            dt = settings.dt
-            rotation_matrix = np.array([[math.cos(omega * dt), -math.sin(omega * dt), 0],
-                                        [math.sin(omega * dt), math.cos(omega * dt), 0],
-                                        [0, 0, 1]])
-            difference_matrix = np.array([[self.x - ICCx],
-                                          [self.y - ICCy],
-                                          [self.theta]])
-            ICC_matrix = np.array([[ICCx],
-                                   [ICCy],
-                                   [omega * dt]])
-            new_location = np.matmul(rotation_matrix, difference_matrix) + ICC_matrix
-            self.x, self.y, self.theta = new_location[0][0], new_location[1][0], new_location[2][0]
-            x_new = self.x
-            y_new = self.y
-
         # If the wheels move at the same velocity, move forward
-        else:
-            self.x = self.x + self.Vl * math.cos(self.theta) * settings.dt
-            self.y = self.y + self.Vl * math.sin(self.theta) * settings.dt
-            x_new = self.x
-            y_new = self.y
+        self.x = self.x + self.v * math.cos(self.theta) * settings.dt
+        self.y = self.y + self.v * math.sin(self.theta) * settings.dt
 
-        # Move the robot in the x direction and check for collision
-        x_speed = x_new - x_old
-        necessary_steps = int(abs(x_speed) // self.l + 1)
-        collisionFound = False
-        # If the step size is too big, move the robot in multiple smaller steps
-        for step in range(necessary_steps):
-            self.rect.centerx = x_old + (step + 1) / necessary_steps * x_speed
-            for entity in walls:
-                intersection = line_intersection([[x_old, y_old], [self.rect.centerx, self.rect.centery]],
-                                                 [[entity.rect.left, entity.rect.top],
-                                                  [entity.rect.left + entity.rect.width, entity.rect.top]])
-                if intersection is not None:
-                    if x_speed > 0:
-                        self.rect.right = self.rect.right - (self.rect.centerx - intersection[0])
-                        self.x = self.rect.centerx
-                    if x_speed < 0:
-                        self.rect.left = self.rect.left + (intersection[1] - entity.rect.centerx)
-                        self.x = self.rect.centerx
-
-                if self.rect.colliderect(entity):
-                    collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top, entity.rect.width,
-                                                             entity.rect.height,
-                                                             self.rect.centerx, self.rect.centery, self.radius)
-                    if collisionFound:
-                        new_x = self.rect.centerx
-                        if x_speed > 0:
-                            while collisionFound:
-                                new_x = new_x - 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width,
-                                                                         entity.rect.height,
-                                                                         new_x, self.rect.centery,
-                                                                         self.radius)
-                            self.rect.right = self.rect.right - (self.rect.centerx - new_x)
-                            self.x = self.rect.centerx
-                        if x_speed < 0:
-                            while collisionFound:
-                                new_x = new_x + 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         new_x, self.rect.centery,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.left = self.rect.left + (new_x - self.rect.centerx)
-                            self.x = self.rect.centerx
-            if collisionFound:
-                break
-
-        # Move the robot in the y direction and check for collision
-        y_speed = y_new - y_old
-        necessary_steps = int(abs(y_speed) // self.l + 1)
-        collisionFound = False
-        # If the step size is too big, move the robot in multiple smaller steps
-        for step in range(necessary_steps):
-            self.rect.centery = y_old + (step + 1) / necessary_steps * y_speed
-            for entity in walls:
-                intersection = line_intersection([[x_old, y_old], [self.rect.centerx, self.rect.centery]],
-                                                 [[entity.rect.left, entity.rect.top],
-                                                  [entity.rect.left + entity.rect.width, entity.rect.top]])
-                if intersection is not None:
-                    if y_speed > 0:
-                        self.rect.bottom = self.rect.bottom - (self.rect.centery - intersection[1])
-                        self.y = self.rect.centery
-                    if y_speed < 0:
-                        self.rect.top = self.rect.top + (intersection[1] - entity.rect.centery)
-                        self.y = self.rect.centery
-                if self.rect.colliderect(entity):
-                    collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top, entity.rect.width,
-                                                             entity.rect.height,
-                                                             self.rect.centerx, self.rect.centery, self.radius)
-                    if collisionFound:
-                        new_y = self.rect.centery
-                        if y_speed > 0:
-                            while collisionFound:
-                                new_y = new_y - 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         self.rect.centerx, new_y,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.bottom = self.rect.bottom - (self.rect.centery - new_y)
-                            self.y = self.rect.centery
-                        if y_speed < 0:
-                            while collisionFound:
-                                new_y = new_y + 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         self.rect.centerx, new_y,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.top = self.rect.top + (new_y - self.rect.centery)
-                            self.y = self.rect.centery
-            if collisionFound:
-                break
+        self.rect.centerx = self.x
+        self.rect.centery = self.y
 
         # Redraw the line indicating the direction the robot is facing
         radius = self.radius
@@ -190,9 +114,6 @@ class Robot(pygame.sprite.Sprite):
         pygame.draw.circle(self.surf, (100, 100, 200, 255), (radius, radius), radius)
         pygame.draw.line(self.surf, (0, 0, 0), (radius, radius),
                          (radius + math.cos(self.theta) * radius, radius + math.sin(self.theta) * radius), 5)
-        # Recalculate the distances for the sensors
-        for sensor in self.sensors:
-            sensor.update(walls, self.theta, radius, self.rect)
 
         # Keep robot on the screen
         if self.rect.left < 0:
@@ -208,245 +129,22 @@ class Robot(pygame.sprite.Sprite):
             self.rect.bottom = settings.SCREEN_HEIGHT
             self.y = self.rect.centery
 
-        # Retain distance of sensors to shape output
-        front_sensors = 0
-        right_sensors = 0
-        left_sensors = 0
-        back_sensors = 0
-        for index, value in enumerate(self.sensors, start=1):
-            if index == 1:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 2:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 12:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 3:
-                right_sensors += round(value.distance - int(self.radius), 0)
-            if index == 4:
-                right_sensors += round(value.distance - int(self.radius), 0)
-            if index == 10:
-                left_sensors += round(value.distance - int(self.radius), 0)
-            if index == 11:
-                left_sensors += round(value.distance - int(self.radius), 0)
-            if index == 5:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 6:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 8:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 9:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 10:
-                back_sensors += round(value.distance - int(self.radius), 0)
-
-                # Calculate behaviour of robot relative to walls
-                self.activation_sensor = round(sensor_output(front_sensors) +
-                                             0.2 * sensor_output(right_sensors) + 0.2 * sensor_output(left_sensors)
-                                               + 0.5 * sensor_output(back_sensors))
-
-        # Check for collision with dust
-        for entity in dusts:
-            if self.rect.colliderect(entity):
-                self.vacuum += 1
-                entity.kill()
-
-
-
-    def update_from_network(self, network, walls, dusts):
-        # Compute network output
-        x = [sensor_output(sensor.distance) for sensor in self.sensors]
-        output = network.feed_forward(x)
-        self.Vl = output[0] * settings.MAX_VELOCITY
-        self.Vr = output[1] * settings.MAX_VELOCITY
-
-        # Move the robot, and register positions
-        x_old = self.rect.centerx
-        y_old = self.rect.centery
-        # If the wheels velocities do not match, calculate the angle in which to move
-        if self.Vl != self.Vr:
-            R = self.radius * (self.Vl + self.Vr) / (self.Vl - self.Vr)
-            omega = (self.Vl - self.Vr) / self.l
-            ICCx = self.x - R * math.sin(self.theta)
-            ICCy = self.y + R * math.cos(self.theta)
-            dt = settings.dt
-            rotation_matrix = np.array([[math.cos(omega * dt), -math.sin(omega * dt), 0],
-                                        [math.sin(omega * dt), math.cos(omega * dt), 0],
-                                        [0, 0, 1]])
-            difference_matrix = np.array([[self.x - ICCx],
-                                          [self.y - ICCy],
-                                          [self.theta]])
-            ICC_matrix = np.array([[ICCx],
-                                   [ICCy],
-                                   [omega * dt]])
-            new_location = np.matmul(rotation_matrix, difference_matrix) + ICC_matrix
-            self.x, self.y, self.theta = new_location[0][0], new_location[1][0], new_location[2][0]
-            x_new = self.x
-            y_new = self.y
-
-        # If the wheels move at the same velocity, move forward
-        else:
-            self.x = self.x + self.Vl * math.cos(self.theta) * settings.dt
-            self.y = self.y + self.Vl * math.sin(self.theta) * settings.dt
-            x_new = self.x
-            y_new = self.y
-
-        # Move the robot in the x direction and check for collision
-        x_speed = x_new - x_old
-        necessary_steps = int(abs(x_speed) // self.l + 1)
-        collisionFound = False
-        # If the step size is too big, move the robot in multiple smaller steps
-        for step in range(necessary_steps):
-            self.rect.centerx = x_old + (step + 1) / necessary_steps * x_speed
-            for entity in walls:
-                intersection = line_intersection([[x_old, y_old], [self.rect.centerx, self.rect.centery]],
-                                                 [[entity.rect.left, entity.rect.top],
-                                                  [entity.rect.left + entity.rect.width, entity.rect.top]])
-                if intersection is not None:
-                    if x_speed > 0:
-                        self.rect.right = self.rect.right - (self.rect.centerx - intersection[0])
-                        self.x = self.rect.centerx
-                    if x_speed < 0:
-                        self.rect.left = self.rect.left + (intersection[1] - entity.rect.centerx)
-                        self.x = self.rect.centerx
-
-                if self.rect.colliderect(entity):
-                    collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top, entity.rect.width,
-                                                             entity.rect.height,
-                                                             self.rect.centerx, self.rect.centery, self.radius)
-                    if collisionFound:
-                        new_x = self.rect.centerx
-                        if x_speed > 0:
-                            while collisionFound:
-                                new_x = new_x - 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width,
-                                                                         entity.rect.height,
-                                                                         new_x, self.rect.centery,
-                                                                         self.radius)
-                            self.rect.right = self.rect.right - (self.rect.centerx - new_x)
-                            self.x = self.rect.centerx
-                        if x_speed < 0:
-                            while collisionFound:
-                                new_x = new_x + 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         new_x, self.rect.centery,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.left = self.rect.left + (new_x - self.rect.centerx)
-                            self.x = self.rect.centerx
-            if collisionFound:
-                break
-
-        # Move the robot in the y direction and check for collision
-        y_speed = y_new - y_old
-        necessary_steps = int(abs(y_speed) // self.l + 1)
-        collisionFound = False
-        # If the step size is too big, move the robot in multiple smaller steps
-        for step in range(necessary_steps):
-            self.rect.centery = y_old + (step + 1) / necessary_steps * y_speed
-            for entity in walls:
-                intersection = line_intersection([[x_old, y_old], [self.rect.centerx, self.rect.centery]],
-                                                 [[entity.rect.left, entity.rect.top],
-                                                  [entity.rect.left + entity.rect.width, entity.rect.top]])
-                if intersection is not None:
-                    # dist =
-                    if y_speed > 0:
-                        self.rect.bottom = self.rect.bottom - (self.rect.centery - intersection[1])
-                        self.y = self.rect.centery
-                    if y_speed < 0:
-                        self.rect.top = self.rect.top + (intersection[1] - entity.rect.centery)
-                        self.y = self.rect.centery
-                if self.rect.colliderect(entity):
-                    collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top, entity.rect.width,
-                                                             entity.rect.height,
-                                                             self.rect.centerx, self.rect.centery, self.radius)
-                    if collisionFound:
-                        new_y = self.rect.centery
-                        if y_speed > 0:
-                            while collisionFound:
-                                new_y = new_y - 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         self.rect.centerx, new_y,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.bottom = self.rect.bottom - (self.rect.centery - new_y)
-                            self.y = self.rect.centery
-                        if y_speed < 0:
-                            while collisionFound:
-                                new_y = new_y + 1
-                                collisionFound, x_col, y_col = collision(entity.rect.left, entity.rect.top,
-                                                                         entity.rect.width, entity.rect.height,
-                                                                         self.rect.centerx, new_y,
-                                                                         self.radius)
-                            collisionFound = True
-                            self.rect.top = self.rect.top + (new_y - self.rect.centery)
-                            self.y = self.rect.centery
-            if collisionFound:
-                break
-
-        self.surf.fill((255, 255, 255, 0))
-        pygame.draw.circle(self.surf, (100, 100, 200, 255), (self.radius, self.radius), self.radius)
-        pygame.draw.line(self.surf, (0, 0, 0), (self.radius, self.radius),
-                         (self.radius + math.cos(self.theta) * self.radius,
-                          self.radius + math.sin(self.theta) * self.radius), 5)
-        # Recalculate the distances for the sensors
-        for sensor in self.sensors:
-            sensor.update(walls, self.theta, self.radius, self.rect)
-
-        # Keep robot on the screen
-        if self.rect.left < 0:
-            self.rect.left = 0
-            self.x = self.rect.centerx
-        if self.rect.right > settings.SCREEN_WIDTH:
-            self.rect.right = settings.SCREEN_WIDTH
-            self.x = self.rect.centerx
-        if self.rect.top <= 0:
-            self.rect.top = 0
-            self.y = self.rect.centery
-        if self.rect.bottom >= settings.SCREEN_HEIGHT:
-            self.rect.bottom = settings.SCREEN_HEIGHT
-            self.y = self.rect.centery
-
-        # Retain distance of sensors to shape output
-        front_sensors = 0
-        right_sensors = 0
-        left_sensors = 0
-        back_sensors = 0
-        for index, value in enumerate(self.sensors, start=1):
-            if index == 1:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 2:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 12:
-                front_sensors += round(value.distance - int(self.radius), 0)
-            if index == 3:
-                right_sensors += round(value.distance - int(self.radius), 0)
-            if index == 4:
-                right_sensors += round(value.distance - int(self.radius), 0)
-            if index == 10:
-                left_sensors += round(value.distance - int(self.radius), 0)
-            if index == 11:
-                left_sensors += round(value.distance - int(self.radius), 0)
-            if index == 5:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 6:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 8:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 9:
-                back_sensors += round(value.distance - int(self.radius), 0)
-            if index == 10:
-                back_sensors += round(value.distance - int(self.radius), 0)
-
-                # Calculate behaviour of robot relative to walls
-                self.activation_sensor = round(sensor_output(front_sensors) +
-                                                0.2 * sensor_output(right_sensors) + 0.2 * sensor_output(left_sensors)
-                                                   + 0.5 * sensor_output(back_sensors))
-
-        # Check for collision with dust
-        for entity in dusts:
-            if self.rect.colliderect(entity):
-                self.vacuum += 1
-                entity.kill()
+        # Update the prediction of the robot location
+        action = np.array([self.v, omega])
+        # Control noise
+        noise_translation, noise_rotation = np.random.normal(0, 1), np.random.normal(0, 0.1)
+        noise_control = [noise_translation, noise_rotation]
+        action = np.add(action, noise_control)
+        dt = settings.dt
+        B = np.array([[dt * math.cos(self.theta), 0],
+                      [dt * math.sin(self.theta), 0],
+                      [0, dt]])
+        R = np.diag([np.random.normal(1), np.random.normal(1), np.random.normal(0.1)])
+        Q = np.diag([np.random.normal(0.5), np.random.normal(0.5), np.random.normal(0.05)])
+        beacon_features = []
+        for beacon in beacons:
+            phi = self.theta - beacon.angle
+            if phi < 0:
+                phi = 2 * math.pi + phi
+            beacon_features.append(np.array([beacon, phi]))
+        self.state, self.covariance = kalman_filter(self.state, self.covariance, action, beacon_features, B, R, Q)

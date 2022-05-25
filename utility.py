@@ -1,96 +1,63 @@
-# Author: Tim Debets
+# Author: Rick van Bellen, Pierre Onghena, Tim Debets
 
 import math
-import numpy as np
+import numpy
+import pygame
 
-
-# Function to calculate distance between two points
 def calc_distance(p1, p2):
     return math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
 
 
-# Function to determine whether two lines intersect
-# Code used from: https://stackoverflow.com/questions/20677795/how-do-i-compute-the-intersection-point-of-two-lines
+def calc_angle(p1, p2):
+    return math.atan(abs(p1[1] - p2[1]) / abs(p1[0] - p2[0]))
 
-# Code used from: https://stackoverflow.com/questions/3838329/how-can-i-check-if-two-segments-intersect
-# to determine whether the intersection point is actually on the two determined line segments
 
-def line_intersection(line1, line2):
-    xdiff = (line1[0][0] - line1[1][0], line2[0][0] - line2[1][0])
-    ydiff = (line1[0][1] - line1[1][1], line2[0][1] - line2[1][1])
+def intersection_points(x0, y0, r0, x1, y1, r1):
+    d = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+    a = (r0 ** 2 - r1 ** 2 + d ** 2) / (2 * d)
+    h = math.sqrt(r0 ** 2 - a ** 2)
+    x2 = x0 + a * (x1 - x0) / d
+    y2 = y0 + a * (y1 - y0) / d
+    x3 = x2 + h * (y1 - y0) / d
+    y3 = y2 - h * (x1 - x0) / d
 
-    def det(a, b):
-        return a[0] * b[1] - a[1] * b[0]
+    x4 = x2 - h * (y1 - y0) / d
+    y4 = y2 + h * (x1 - x0) / d
 
-    div = det(xdiff, ydiff)
-    if div == 0:
-        return
+    return (x3, y3), (x4, y4)
 
-    d = (det(*line1), det(*line2))
-    x = det(d, xdiff) / div
-    y = det(d, ydiff) / div
 
-    # Check whether the calculated intersection point is actually part of the two line segments
-    # we are using to calculate the intersection point
-    if ((round(x) < round(max(min(line1[0][0], line1[1][0]), min(line2[0][0], line2[1][0])))) or
-            (round(x) > round(min(max(line1[0][0], line1[1][0]), max(line2[0][0], line2[1][0]))))):
-        return
+# This function adds a possibility to add dashed line in our simulator
+# code inspired by: https://codereview.stackexchange.com/questions/70143/drawing-a-dashed-line-with-pygame
+
+def draw_dashed_line(surf, color, start_pos, end_pos, width=3, dash_length=10):
+    x1, y1 = start_pos
+    x2, y2 = end_pos
+    dl = dash_length
+
+    if (x1 == x2):
+        ycoords = [y for y in range(int(y1), int(y2), int(dl) if y1 < y2 else -dl)]
+        xcoords = [x1] * len(ycoords)
+    elif (y1 == y2):
+        xcoords = [x for x in range(int(x1), int(x2), int(dl) if x1 < x2 else -dl)]
+        ycoords = [y1] * len(xcoords)
     else:
-        if ((round(y) < round(max(min(line1[0][1], line1[1][1]), min(line2[0][1], line2[1][1])))) or
-                (round(y) > round(min(max(line1[0][1], line1[1][1]), max(line2[0][1], line2[1][1]))))):
-            return
+        a = abs(x2 - x1)
+        b = abs(y2 - y1)
+        c = round(math.sqrt(a**2 + b**2))
+        if c != 0:
+            dx = dl * a / c
+            dy = dl * b / c
         else:
-            return x, y
+            return
 
+        xcoords = [x for x in numpy.arange(x1, x2, dx if x1 < x2 else -dx)]
+        ycoords = [y for y in numpy.arange(y1, y2, dy if y1 < y2 else -dy)]
 
-# To determine of a rectangle collides with a circle
-# Inspiration from: https://stackoverflow.com/questions/24727773/detecting-rectangle-collision-with-a-circle
-def collision(rleft, rtop, width, height,  # rectangle definition
-              center_x, center_y, radius):  # circle definition
-    """ Detect collision between a rectangle and circle. """
+    next_coords = list(zip(xcoords[1::2], ycoords[1::2]))
+    last_coords = list(zip(xcoords[0::2], ycoords[0::2]))
+    for (x1, y1), (x2, y2) in zip(next_coords, last_coords):
+        start = (round(x1), round(y1))
+        end = (round(x2), round(y2))
+        pygame.draw.line(surf, color, start, end, width)
 
-    # complete boundbox of the rectangle
-    rright, rbottom = rleft + width, rtop + height
-
-    # bounding box of the circle
-    cleft, ctop = center_x - radius, center_y - radius
-    cright, cbottom = center_x + radius, center_y + radius
-
-    # trivial reject if bounding boxes do not intersect
-    if rright < cleft or rleft > cright or rbottom < ctop or rtop > cbottom:
-        return False, 0, 0  # no collision possible
-
-    # check whether any point of rectangle is inside circle's radius
-    for x in range(rleft, rleft + width + 1):
-        for y in range(rtop, rtop + height + 1):
-            # compare distance between circle's center point and each point of
-            # the rectangle with the circle's radius
-            distance = math.hypot(x - center_x, y - center_y)
-            if distance < radius:
-                return True, x, y  # collision detected
-
-    # check if center of circle is inside rectangle
-    if rleft <= center_x <= rright and rtop <= center_y <= rbottom:
-        return True, 0, 0  # overlaid
-
-    return False, 0, 0  # no collision detected
-
-
-# TODO: use the function with A from the slides
-def sensor_output(distance):
-    max_output = 100
-    min_factor = 0.00
-    influence_faraway = 20
-    return max_output + ((max_output * min_factor) - max_output) * (1 - math.exp(-distance / influence_faraway))
-
-
-# calculate the euclidean distance of our population
-def euclidean_distance(population):
-    total_distance = 0
-    for i in range(len(population)):
-        for j in range(i + 1, len(population)):
-            for genome in range(len(population[i])):
-                difference = population[i][genome] - population[j][genome]
-                total_distance += difference ** 2
-    total_distance = np.sqrt(total_distance)
-    return total_distance
