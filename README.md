@@ -1,7 +1,8 @@
-# ARSgroup2
+# Autonomous Robotic Systems
+
+This project entails evolutionary algorithms and localization.
 
 Controls for the robot are:
-
 - W to increase speed of left wheel
 - S to decrease speed of left wheel
 - O to increase speed of right wheel
