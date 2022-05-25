@@ -1,6 +1,8 @@
 # Autonomous Robotic Systems
 
-This project entails evolutionary algorithms and localization.
+This project entails swarm intelligence, evolutionary algorithms and localization within a robot environment.
+The evolutionary algorithm is based upon a fitness function so that as much area is covered between the walls.
+The localization implements kalman filters to track the position of the robots by the landmarks.
 
 Controls for the robot are:
 - W to increase speed of left wheel
